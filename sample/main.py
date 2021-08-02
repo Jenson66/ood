@@ -10,8 +10,6 @@ import torch.multiprocessing as mp
 
 import ood
 
-# TODO: unit testing
-
 
 def save_checkpoint(filename, sys_data, instance_data, data, num_endpoints, r, stats=None):
     if not os.path.exists(filename[:filename.rfind('/')]):
