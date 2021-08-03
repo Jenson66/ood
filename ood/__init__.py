@@ -163,7 +163,7 @@ def foolsgold_srv(instance_data):
         alpha = alpha / alpha.sum()
         for k, p in enumerate(instance_data.model.get_params()):
             for i in idx:
-                p.data.add_((1/len(idx)) * grads[k][i])
+                p.data.add_(alpha[i] * grads[k][i])
 
 
 
@@ -225,7 +225,7 @@ def viceroy_srv(instance_data):
         alpha = alpha / alphs if (alphs := alpha.sum()) > 0 else torch.zeros(alpha.shape)
         for k, p in enumerate(instance_data.model.get_params()):
             for i in idx:
-                p.data.add_((1/len(idx)) * grads[k][i])
+                p.data.add_(alpha[i] * grads[k][i])
 
 # STD-DAGMM
 
