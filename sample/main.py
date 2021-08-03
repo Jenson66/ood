@@ -60,7 +60,6 @@ def init_server(num_endpoints, fn, batch_size, checkpoint_round=1, checkpoint_fn
             "lr": 0.01,
             "params_mul": 10,
             "checkpoint": checkpoint_round,
-            "delay": -1
         }]
         dist.broadcast_object_list(params, 0)
         sys_data = params[0]
@@ -91,10 +90,7 @@ def init_server(num_endpoints, fn, batch_size, checkpoint_round=1, checkpoint_fn
 
     # Run learning
     for r in range(start, sys_data["rounds"]):
-        if r < sys_data['delay']:
-            ood.fed_avg_srv(instance_data)
-        else:
-            fn(instance_data)
+        fn(instance_data)
         bm = ood.utils.benchmark(instance_data.model, instance_data.dataset)
         for k, v in bm.items():
             if stats.get(k) is None:
@@ -137,44 +133,7 @@ def init_endpoint(e_id, num_endpoints, fn, batch_size, checkpoint_fn=None, backe
 
     # Run learning
     for r in range(start, sys_data["rounds"]):
-        if r < sys_data['delay']:
-            ood.bs_grads_end(instance_data)
-        else:
-            fn(instance_data)
-        if sys_data['checkpoint'] > 0 and (r % sys_data['checkpoint']) == 0:
-            filename = f"checkpoints/endpoint_{e_id}/round_{r}"
-            save_checkpoint(filename, sys_data, instance_data, data, num_endpoints, r)
-
-
-def init_adversary(e_id, num_endpoints, fn, batch_size, checkpoint_fn=None, backend='gloo'):
-    # Setup adversary
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend, rank=e_id + 1, world_size=num_endpoints + 1)
-    if checkpoint_fn is None:
-        params = [None]
-        dist.broadcast_object_list(params, 0)
-        sys_data = params[0]
-        data = ood.utils.load_data(sys_data['data'], batch_size, train=True, classes=[5])
-        data['dataloader'].dataset.targets[:] = 2
-        sys_data['num_in'] = data['x_dim']
-        sys_data['num_out'] = data['y_dim']
-        instance_data = ood.utils.InstanceData(
-            ood.utils.load_model(sys_data['architecture'], sys_data['lr'], sys_data['device'], sys_data),
-            data['dataloader'],
-            num_endpoints,
-            { "epochs": 1, "verbose": False}
-        )
-        start = 0
-    else:
-        sys_data, instance_data, data, start, _ = load_checkpoint(checkpoint_fn)
-
-    # Run learning
-    for r in range(start, sys_data["rounds"]):
-        if r < sys_data['delay']:
-            ood.bs_grads_end(instance_data)
-        else:
-            fn(instance_data)
+        fn(instance_data)
         if sys_data['checkpoint'] > 0 and (r % sys_data['checkpoint']) == 0:
             filename = f"checkpoints/endpoint_{e_id}/round_{r}"
             save_checkpoint(filename, sys_data, instance_data, data, num_endpoints, r)
@@ -185,11 +144,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", dest="checkpoint", metavar="C", type=int, default=0, help="Checkpoint at every C rounds (default: no checkpointing)")
     parser.add_argument("--endpoints", dest="endpoints", metavar="N", type=int, default=1, help="Number of endpoints/users (default: 1)")
     parser.add_argument("--load", dest="load", metavar="R", type=int, default=-1, help="Load a checkpoint from round R (default: do not load a checkpoint)")
-    parser.add_argument("--adversaries", dest="adversaries", metavar="M", type=int, default=1, help="Number of adversaries (default: 0)")
     args = parser.parse_args()
 
     srv_alg, end_alg = ood.load_algorithm_pair("foolsgold")
-    total_nodes = args.endpoints + args.adversaries
+    total_nodes = args.endpoints
     if args.load < 0:
         processes = [mp.Process(target=init_server, args=(total_nodes, srv_alg, 128, args.checkpoint))]
     else:
@@ -202,12 +160,6 @@ if __name__ == "__main__":
             processes.append(mp.Process(target=init_endpoint, args=(e, total_nodes, end_alg, batch_sizes[e])))
         else:
             processes.append(mp.Process(target=init_endpoint, args=(e, total_nodes, end_alg, batch_sizes[e], f"checkpoints/endpoint_{e}/round_{args.load}")))
-    for a in range(args.adversaries):
-        e = args.endpoints + a
-        if args.load < 0:
-            processes.append(mp.Process(target=init_adversary, args=(e, total_nodes, end_alg, batch_sizes[e])))
-        else:
-            processes.append(mp.Process(target=init_adversary, args=(e, total_nodes, end_alg, batch_sizes[e], f"checkpoints/endpoint_{e}/round_{args.load}")))
     for p in processes:
         p.start()
     for p in processes:
