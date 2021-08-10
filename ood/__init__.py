@@ -49,6 +49,20 @@ def grads_end(instance_data):
         dist.gather(grad, dst=0)
 
 
+def grads_srv(instance_data, fn):
+    with torch.no_grad():
+         # send a copy of the global model
+        for param in instance_data.model.get_params():
+            dist.broadcast(tensor=param, src=0)
+        # get the gradients
+        grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
+        for i, _ in enumerate(instance_data.model.get_params()):
+            dist.gather(grads[i][0], gather_list=grads[i], dst=0)
+            grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
+        # aggregate the gradients
+        fn(instance_data, grads)
+
+
 def bs_grads_end(instance_data):
     """The endpoint/client end that shares gradients and batch sizes after training"""
     # receive a copy of the global model
@@ -61,9 +75,8 @@ def bs_grads_end(instance_data):
     for grad in grads:
         dist.gather(grad, dst=0)
 
-# Federated averaging
 
-def fed_avg_srv(instance_data):
+def bs_grads_srv(instance_data, fn):
     """The server end of federated averaging"""
     with torch.no_grad():
         # send a copy of the global model
@@ -79,156 +92,123 @@ def fed_avg_srv(instance_data):
         for i, _ in enumerate(instance_data.model.get_params()):
             dist.gather(grads[i][0], gather_list=grads[i], dst=0)
             grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
-        # perform federated averaging
-        for param, grad in zip(instance_data.model.get_params(), grads):
-            for b, g in zip(batch_sizes, grad):
-                g *= b
-            param.data.add_(grad.sum(dim=0))
+        # perform federated aggregation
+        fn(instance_data, batch_sizes, grads)
 
 
-# Krum
+def fed_avg(instance_data, batch_sizes, grads):
+    for param, grad in zip(instance_data.model.get_params(), grads):
+        for b, g in zip(batch_sizes, grad):
+            g *= b
+        param.data.add_(grad.sum(dim=0))
 
-def krum_srv(instance_data):
-    with torch.no_grad():
-         # send a copy of the global model
-        for param in instance_data.model.get_params():
-            dist.broadcast(tensor=param, src=0)
-        # get the gradients
-        grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
-        for i, _ in enumerate(instance_data.model.get_params()):
-            dist.gather(grads[i][0], gather_list=grads[i], dst=0)
-            grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
-        # perform krum
-        clip = instance_data.other_params["clip"]
-        flat_grads = flatten_grads(grads, instance_data.model.device)
-        num_clients = len(flat_grads)
-        scores = torch.zeros(num_clients)
-        dists = torch.sum(flat_grads**2, axis=1)[:, None] + torch.sum(flat_grads**2, axis=1)[None] - 2 * torch.mm(flat_grads, flat_grads.T)
-        for i in range(num_clients):
-            scores[i] = torch.sum(
-                torch.sort(dists[i]).values[1:num_clients - clip - 1]
+
+def krum(instance_data, grads):
+    clip = instance_data.other_params["clip"]
+    flat_grads = flatten_grads(grads, instance_data.model.device)
+    num_clients = len(flat_grads)
+    scores = torch.zeros(num_clients)
+    dists = torch.sum(flat_grads**2, axis=1)[:, None] + torch.sum(flat_grads**2, axis=1)[None] - 2 * torch.mm(flat_grads, flat_grads.T)
+    for i in range(num_clients):
+        scores[i] = torch.sum(
+            torch.sort(dists[i]).values[1:num_clients - clip - 1]
+        )
+    idx = np.argpartition(scores, num_clients - clip)[:num_clients - clip]
+    idx = idx.tolist()
+    for k, p in enumerate(instance_data.model.get_params()):
+        for i in idx:
+            p.data.add_((1/len(idx)) * grads[k][i])
+
+        
+def foolsgold(instance_data, grads):
+    flat_grads = flatten_grads(grads, instance_data.model.device)
+    idx = list(range(len(flat_grads)))
+    num_clients = len(flat_grads)
+    cs = torch.tensor(
+        [[0 for _ in range(num_clients)] for _ in range(num_clients)],
+        dtype=torch.float32
+    )
+    v = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32)
+    alpha = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32)
+    for i in idx:
+        instance_data.other_params['histories'][i] += flat_grads[i]
+    for i in idx:
+        for j in {x for x in idx} - {i}:
+            cs[i][j] = torch.cosine_similarity(
+                instance_data.other_params['histories'][i],
+                instance_data.other_params['histories'][j],
+                dim=0
             )
-        idx = np.argpartition(scores, num_clients - clip)[:num_clients - clip]
-        idx = idx.tolist()
-        for k, p in enumerate(instance_data.model.get_params()):
-            for i in idx:
-                p.data.add_((1/len(idx)) * grads[k][i])
-
-
-# Foolsgold
-
-def foolsgold_srv(instance_data):
-    with torch.no_grad():
-         # send a copy of the global model
-        for param in instance_data.model.get_params():
-            dist.broadcast(tensor=param, src=0)
-        # get the gradients
-        grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
-        for i, _ in enumerate(instance_data.model.get_params()):
-            dist.gather(grads[i][0], gather_list=grads[i], dst=0)
-            grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
-        # perform foolsgold
-        flat_grads = flatten_grads(grads, instance_data.model.device)
-        idx = list(range(len(flat_grads)))
-        num_clients = len(flat_grads)
-        cs = torch.tensor(
-            [[0 for _ in range(num_clients)] for _ in range(num_clients)],
-            dtype=torch.float32
-        )
-        v = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32)
-        alpha = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32)
+        v[i] = max(cs[i])
+    for i in idx:
+        for j in idx:
+            if (v[j] > v[i]) and (v[j] != 0):
+                cs[i][j] *= v[i] / v[j]
+        alpha[i] = 1 - max(cs[i])
+    alpha = alpha / max(alpha)
+    ids = alpha != 1
+    alpha[ids] = instance_data.other_params['kappa'] * (
+        torch.log(alpha[ids] / (1 - alpha[ids])) + 0.5
+    )
+    alpha[alpha > 1] = 1
+    alpha[alpha < 0] = 0
+    alpha[alpha.isnan()] = 0
+    alpha = alpha / alpha.sum()
+    for k, p in enumerate(instance_data.model.get_params()):
         for i in idx:
-            instance_data.other_params['histories'][i] += flat_grads[i]
-        for i in idx:
-            for j in {x for x in idx} - {i}:
-                cs[i][j] = torch.cosine_similarity(
-                    instance_data.other_params['histories'][i],
-                    instance_data.other_params['histories'][j],
-                    dim=0
-                )
-            v[i] = max(cs[i])
-        for i in idx:
-            for j in idx:
-                if (v[j] > v[i]) and (v[j] != 0):
-                    cs[i][j] *= v[i] / v[j]
-            alpha[i] = 1 - max(cs[i])
-        alpha = alpha / max(alpha)
-        ids = alpha != 1
-        alpha[ids] = instance_data.other_params['kappa'] * (
-            torch.log(alpha[ids] / (1 - alpha[ids])) + 0.5
-        )
-        alpha[alpha > 1] = 1
-        alpha[alpha < 0] = 0
-        alpha[alpha.isnan()] = 0
-        alpha = alpha / alpha.sum()
-        for k, p in enumerate(instance_data.model.get_params()):
-            for i in idx:
-                p.data.add_(alpha[i] * grads[k][i])
+            p.data.add_(alpha[i] * grads[k][i])
 
 
-
-# Viceroy
-
-def viceroy_srv(instance_data):
-    with torch.no_grad():
-         # send a copy of the global model
-        for param in instance_data.model.get_params():
-            dist.broadcast(tensor=param, src=0)
-        # get the gradients
-        grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
-        for i, _ in enumerate(instance_data.model.get_params()):
-            dist.gather(grads[i][0], gather_list=grads[i], dst=0)
-            grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
-        # perform viceroy
-        flat_grads = flatten_grads(grads, instance_data.model.device)
-        idx = list(range(len(flat_grads)))
-        num_clients = len(flat_grads)
-        alpha = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
-        gamma = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
-        b = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
-        G = torch.zeros(instance_data.other_params['histories'][idx[0]].shape, device=instance_data.model.device)
-        for i in idx:
-            if instance_data.other_params['first']:
-                instance_data.other_params['rep'][i] = 1
-            else:
-                if instance_data.other_params['rep'][i] < 0:
-                    instance_data.other_params['rep'][i] = 0.97**(abs(torch.cosine_similarity(instance_data.other_params['histories'][i], flat_grads[i], dim=0))) * instance_data.other_params['rep'][i]
-                    instance_data.other_params['histories'][i] *= 0.9
-                else:
-                    instance_data.other_params['rep'][i] = torch.clip(0.9 * instance_data.other_params['rep'][i] + 0.5 *
-                            torch.tanh(2 * abs(torch.cosine_similarity(instance_data.other_params['histories'][i],
-                                flat_grads[i], dim=0)) - 1), 0, 1)
-                    instance_data.other_params['histories'][i] = 0.9 * instance_data.other_params['histories'][i] + flat_grads[i]
-                    if instance_data.other_params['rep'][i] < 0.1:
-                        instance_data.other_params['rep'][i] = -1
-            G += instance_data.other_params['histories'][i]
-        G /= len(idx)
-        S = instance_data.other_params['kappa'] * G / 21.85
-        B = torch.tensor(0.0, device=instance_data.model.device)
-        for i in idx:
-            if instance_data.other_params['first']:
-                gamma[i] = 1
-            else:
-                gamma[i] = 1 - abs(torch.cosine_similarity(instance_data.other_params['histories'][i], G, dim=0))
-            for j in set(idx) - {i}:
-                b[i] += torch.cdist(flat_grads[i].unsqueeze(0), flat_grads[j].unsqueeze(0)).item()
-            b[i] /= len(idx) - 1
-            B += torch.cdist(S.unsqueeze(0), flat_grads[i].unsqueeze(0)).item()
-        B /= len(idx)
-        alpha = torch.exp(-(2 / torch.norm(S)) * (b - B)**2)
+def viceroy(instance_data, grads):
+    flat_grads = flatten_grads(grads, instance_data.model.device)
+    idx = list(range(len(flat_grads)))
+    num_clients = len(flat_grads)
+    alpha = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
+    gamma = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
+    b = torch.tensor([0 for _ in range(num_clients)], dtype=torch.float32, device=instance_data.model.device)
+    G = torch.zeros(instance_data.other_params['histories'][idx[0]].shape, device=instance_data.model.device)
+    for i in idx:
         if instance_data.other_params['first']:
-            instance_data.other_params['first'] = False
-        alpha = alpha * instance_data.other_params['rep'] * gamma
-        alpha[alpha > 1] = 1
-        alpha[alpha < 0] = 0
-        alpha[alpha.isnan()] = 0
-        alpha = alpha / alphs if (alphs := alpha.sum()) > 0 else torch.zeros(alpha.shape)
-        for k, p in enumerate(instance_data.model.get_params()):
-            for i in idx:
-                p.data.add_(alpha[i] * grads[k][i])
+            instance_data.other_params['rep'][i] = 1
+        else:
+            if instance_data.other_params['rep'][i] < 0:
+                instance_data.other_params['rep'][i] = 0.97**(abs(torch.cosine_similarity(instance_data.other_params['histories'][i], flat_grads[i], dim=0))) * instance_data.other_params['rep'][i]
+                instance_data.other_params['histories'][i] *= 0.9
+            else:
+                instance_data.other_params['rep'][i] = torch.clip(0.9 * instance_data.other_params['rep'][i] + 0.5 *
+                        torch.tanh(2 * abs(torch.cosine_similarity(instance_data.other_params['histories'][i],
+                            flat_grads[i], dim=0)) - 1), 0, 1)
+                instance_data.other_params['histories'][i] = 0.9 * instance_data.other_params['histories'][i] + flat_grads[i]
+                if instance_data.other_params['rep'][i] < 0.1:
+                    instance_data.other_params['rep'][i] = -1
+        G += instance_data.other_params['histories'][i]
+    G /= len(idx)
+    S = instance_data.other_params['kappa'] * G / 21.85
+    B = torch.tensor(0.0, device=instance_data.model.device)
+    for i in idx:
+        if instance_data.other_params['first']:
+            gamma[i] = 1
+        else:
+            gamma[i] = 1 - abs(torch.cosine_similarity(instance_data.other_params['histories'][i], G, dim=0))
+        for j in set(idx) - {i}:
+            b[i] += torch.cdist(flat_grads[i].unsqueeze(0), flat_grads[j].unsqueeze(0)).item()
+        b[i] /= len(idx) - 1
+        B += torch.cdist(S.unsqueeze(0), flat_grads[i].unsqueeze(0)).item()
+    B /= len(idx)
+    alpha = torch.exp(-(2 / torch.norm(S)) * (b - B)**2)
+    if instance_data.other_params['first']:
+        instance_data.other_params['first'] = False
+    alpha = alpha * instance_data.other_params['rep'] * gamma
+    alpha[alpha > 1] = 1
+    alpha[alpha < 0] = 0
+    alpha[alpha.isnan()] = 0
+    alpha = alpha / alphs if (alphs := alpha.sum()) > 0 else torch.zeros(alpha.shape)
+    for k, p in enumerate(instance_data.model.get_params()):
+        for i in idx:
+            p.data.add_(alpha[i] * grads[k][i])
+
 
 # STD-DAGMM
-
 class STD_DAGMM(nn.Module):
     """
     Based on https://github.com/danieltan07/dagmm
@@ -409,21 +389,7 @@ class STD_DAGMM(nn.Module):
             self.optimizer.step()
 
 
-def std_dagmm_srv(instance_data):
-    # send a copy of the global model
-    for param in instance_data.model.get_params():
-        dist.broadcast(tensor=param, src=0)
-    # get the batch sizes
-    batch_sizes = [torch.zeros(1, dtype=float) for _ in range(instance_data.total_nodes + 1)]
-    dist.gather(torch.zeros(1, dtype=float), gather_list=batch_sizes, dst=0)
-    print(f"batch sizes = {batch_sizes}")
-    # get the gradients
-    grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
-    for i, _ in enumerate(instance_data.model.get_params()):
-        dist.gather(grads[i][0], gather_list=grads[i], dst=0)
-        grads[i] = torch.tensor([g.tolist() for g in grads[i][1:]], dtype=torch.float32)
-    print(f"grads = {grads}")
-    # perform std-dagmm
+def std_dagmm(instance_data, batch_sizes, grads):
     flat_grads = flatten_grads(grads, instance_data.model.device)
     num_clients = len(flat_grads)
     if instance_data.other_params['gmm'] is None:
@@ -444,6 +410,24 @@ def std_dagmm_srv(instance_data):
             alpha[i] = batch_sizes[i] / total_dc
             for k, p in enumerate(instance_data.model.get_params()):
                 p.data.add_(alpha[i] * grads[k][i])
+
+
+# Server functions defined for the sake of pickling
+
+def fed_avg_srv(instance_data):
+    return bs_grads_srv(instance_data, fed_avg)
+
+def krum_srv(instance_data):
+    return grads_srv(instance_data, krum)
+
+def foolsgold_srv(instance_data):
+    return grads_srv(instance_data, foolsgold)
+
+def viceroy_srv(instance_data):
+    return grads_srv(instance_data, viceroy)
+
+def std_dagmm_srv(instance_data):
+    return bs_grads_srv(instance_data, std_dagmm)
 
 
 # Algorithm loader
