@@ -146,7 +146,7 @@ if __name__ == "__main__":
     parser.add_argument("--load", dest="load", metavar="R", type=int, default=-1, help="Load a checkpoint from round R (default: do not load a checkpoint)")
     args = parser.parse_args()
 
-    srv_alg, end_alg = ood.load_algorithm_pair("foolsgold")
+    srv_alg, end_alg = ood.load_algorithm_pair("federated averaging")
     total_nodes = args.endpoints
     if args.load < 0:
         processes = [mp.Process(target=init_server, args=(total_nodes, srv_alg, 128, args.checkpoint))]

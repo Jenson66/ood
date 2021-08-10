@@ -86,7 +86,6 @@ def bs_grads_srv(instance_data, fn):
         batch_sizes = [torch.zeros(1, dtype=float) for _ in range(instance_data.total_nodes + 1)]
         dist.gather(torch.zeros(1, dtype=float), gather_list=batch_sizes, dst=0)
         batch_sizes = torch.tensor([bs.item() for bs in batch_sizes[1:]]) # eliminate this batch size
-        batch_sizes /= batch_sizes.sum()
         # get the gradients
         grads = [[torch.zeros(p.shape, dtype=torch.float32) for _ in range(instance_data.total_nodes + 1)] for p in instance_data.model.get_params()]
         for i, _ in enumerate(instance_data.model.get_params()):
@@ -97,9 +96,11 @@ def bs_grads_srv(instance_data, fn):
 
 
 def fed_avg(instance_data, batch_sizes, grads):
+    total_dc = batch_sizes.sum()
+    alpha = batch_sizes / total_dc
     for param, grad in zip(instance_data.model.get_params(), grads):
-        for b, g in zip(batch_sizes, grad):
-            g *= b
+        for a, g in zip(alpha, grad):
+            g *= a
         param.data.add_(grad.sum(dim=0))
 
 
