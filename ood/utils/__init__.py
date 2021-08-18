@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,8 @@ def benchmark(model: Model, data: torch.utils.data.DataLoader) -> dict:
     return {"loss": loss / len(data), "accuracy": acc / data_count}
 
 
-class InstanceData(NamedTuple):
+@dataclass
+class InstanceData():
     """Data that is stored by each instance of a node in the system"""
     model: Model
     dataset: torch.utils.data.DataLoader
