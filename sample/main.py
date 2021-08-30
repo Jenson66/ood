@@ -98,9 +98,6 @@ def init_endpoint(e_id, num_endpoints, fn, data, backend='gloo'):
     params = [None]
     dist.broadcast_object_list(params, 0)
     sys_data = params[0]
-    idx = data.dataset.targets == e_id
-    data.dataset.data = data.dataset.data[idx]
-    data.dataset.targets = data.dataset.targets[idx]
     net = skorch.NeuralNetClassifier(
         MLP,
         lr=sys_data['lr'],
